@@ -1,71 +1,90 @@
-# Navidrome to MusicBrainz Ratings Push
+# MusicBrainz Ratings Helper
 
-This script reads ratings from Navidrome over its Subsonic API and submits them to MusicBrainz.
+Push Navidrome ratings to MusicBrainz.
 
-It supports:
+The helper reads ratings from Navidrome through the Subsonic API and submits them to MusicBrainz as:
 
-- song ratings -> MusicBrainz recordings
-- album ratings -> MusicBrainz release groups
 - artist ratings -> MusicBrainz artists
+- album ratings -> MusicBrainz release groups
+- song ratings -> MusicBrainz recordings
 
-For songs, it will also expand a release-group match and rate every matching recording it can find in that group instead of stopping at the first one.
+For songs, release-group expansion is enabled by default. When a rated Navidrome song belongs to a MusicBrainz release group, the helper finds matching recordings in that group so alternate releases can receive the same recording rating.
 
 ## Setup
 
-1. Install dependencies:
+Install dependencies:
 
-   `python -m pip install -r requirements.txt`
+```powershell
+python -m pip install -r requirements.txt
+```
 
-Optional: run inside a Python virtual environment (recommended)
+Using a virtual environment is recommended:
 
-- Windows (PowerShell):
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   python -m pip install -r requirements.txt
-   ```
+Create a `.env` or set these environment variables:
 
-- Windows (cmd.exe):
+```text
+NAVIDROME_BASE_URL=https://navidrome.example.com
+NAVIDROME_USERNAME=your-navidrome-username
+NAVIDROME_PASSWORD=your-navidrome-password
 
-   ```cmd
-   python -m venv .venv
-   .\.venv\Scripts\activate.bat
-   python -m pip install -r requirements.txt
-   ```
+MB_USERNAME=your-musicbrainz-username
+MB_PASSWORD=your-musicbrainz-password
+```
 
-- Unix/macOS:
+## Usage
 
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   python -m pip install -r requirements.txt
-   ```
+Preview what would be submitted:
 
-2. Set your Navidrome and MusicBrainz credentials:
+```powershell
+python musicbrainz-ratings-helper.py --dry-run
+```
 
-   - `NAVIDROME_BASE_URL`
-   - `NAVIDROME_USERNAME`
-   - `NAVIDROME_PASSWORD`
+Run for one Navidrome artist:
 
-   - `MB_USERNAME`
-   - `MB_PASSWORD`
+```powershell
+python musicbrainz-ratings-helper.py --dry-run --artist-id 5YPCM8WgUTYDxJPS8QUuOO
+```
 
-3. Run the script:
+Submit ratings for real:
 
-   `python musicbrainz-ratings-helper.py`
+```powershell
+python musicbrainz-ratings-helper.py
+```
 
-## Useful flags
+## Useful Flags
 
-- `--navidrome-base-url`, `--navidrome-username`, and `--navidrome-password` to override environment variables
-- `--entity song --entity album --entity artist` to limit what gets exported
-- `--dry-run` to preview submissions
-- `--max-targets 1` to limit a dry run to the first resolved target
-- `--no-expand-release-groups` to disable release-group fan-out for songs
+- `--dry-run` previews the same rating batches without posting to MusicBrainz.
+- `--artist-id ID` limits album and song processing to one Navidrome artist.
+- `--entity song`, `--entity album`, and `--entity artist` limit exported entity types. Repeat the flag for multiple types.
+- `--max-artists N` limits artist rating collection.
+- `--max-albums N` limits album/song collection.
+- `--no-expand-release-groups` disables recording fan-out within release groups.
+- `--log-level DEBUG` shows detailed matching and MusicBrainz resolution logs.
+
+## Logging
+
+Normal logs are grouped by artist and album. Rating lines show the Navidrome source rating and the MusicBrainz rating that will be submitted:
+
+```text
+Artist: s:2 -> mb:40 | 3Breezy / 3Breezy: dry-run
+Album: s:3 -> mb:60 | Murda She Wrote / 3Breezy: dry-run
+Recording: s:2 -> mb:40 | Bacc To Tha Basics / 3Breezy: dry-run
+```
+
+The final summary includes scanned counts and previewed/submitted counts.
+
+Detailed recording ID resolution is logged only with `--log-level DEBUG`.
 
 ## Notes
 
-- The script submits one through five star ratings and converts them to MusicBrainz's 0-100 scale.
-- Zero ratings are skipped.
-- MusicBrainz requires authenticated XML POST submissions and a meaningful client string.
-- Navidrome access uses the Subsonic API only; the script does not read the database directly.
+- Navidrome uses 1-5 star ratings. MusicBrainz user ratings use a 0-100 scale, so the helper submits `rating * 20`.
+- Zero or missing ratings are skipped.
+- MusicBrainz API requests are throttled to about one request per second.
+- Rating submissions are batched into one MusicBrainz POST where possible instead of sending one request per rating.
+- Navidrome access uses the Subsonic API only; the helper does not read the Navidrome database directly.
