@@ -161,6 +161,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_dotenv_file(path: str = ".env") -> None:
+    """Load simple KEY=VALUE pairs from a local .env file."""
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
 def normalize_text(value: str | None) -> str:
     return " ".join((value or "").strip().lower().split())
 
@@ -1058,6 +1082,7 @@ def flush_and_count(
 
 def main() -> int:
     args = parse_args()
+    load_dotenv_file()
 
     # Start time for run duration reporting
     start_time = time.time()
