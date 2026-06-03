@@ -37,6 +37,8 @@ MB_USERNAME=your-musicbrainz-username
 MB_PASSWORD=your-musicbrainz-password
 ```
 
+The helper automatically reads `.env` from the current project directory.
+
 ## Usage
 
 Preview what would be submitted:
