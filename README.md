@@ -14,15 +14,15 @@ For songs, release-group expansion is enabled by default. When a rated Navidrome
 
 Install dependencies:
 
-```powershell
-python -m pip install -r requirements.txt
+```bash
+python3 -m pip install -r requirements.txt
 ```
 
-Using a virtual environment is recommended:
+Using a Linux virtual environment is recommended:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
@@ -41,19 +41,19 @@ MB_PASSWORD=your-musicbrainz-password
 
 Preview what would be submitted:
 
-```powershell
+```bash
 python musicbrainz-ratings-helper.py --dry-run
 ```
 
 Run for one Navidrome artist:
 
-```powershell
+```bash
 python musicbrainz-ratings-helper.py --dry-run --artist-id 5YPCM8WgUTYDxJPS8QUuOO
 ```
 
 Submit ratings for real:
 
-```powershell
+```bash
 python musicbrainz-ratings-helper.py
 ```
 
