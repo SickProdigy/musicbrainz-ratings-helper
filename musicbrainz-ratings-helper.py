@@ -33,7 +33,8 @@ MUSICBRAINZ_BASE_URL = "https://musicbrainz.org/ws/2"
 MUSICBRAINZ_XML_NS = "http://musicbrainz.org/ns/mmd-2.0#"
 CLIENT_NAME = "musicbrainz-ratings-helper-0.1.1"
 SCRIPT_VERSION = "v0.1.1"
-NAVIDROME_RETRY_DELAYS = [2, 4, 6, 8, 10]
+NAVIDROME_REQUEST_TIMEOUTS = [10, 20, 30, 45, 60]
+NAVIDROME_RETRY_DELAYS = [5, 10, 15, 20, 30]
 MUSICBRAINZ_RETRY_DELAYS = [3, 10, 30, 60, 120]
 
 # Colors for logging
@@ -320,6 +321,7 @@ class NavidromeClient:
     def _request(self, endpoint: str, params: dict[str, object]) -> dict:
         """Make a Navidrome API request with retry logic and exponential backoff."""
         retry_delays = NAVIDROME_RETRY_DELAYS
+        request_timeouts = NAVIDROME_REQUEST_TIMEOUTS
         max_retries = len(retry_delays)
         
         for attempt in range(max_retries):
@@ -335,7 +337,12 @@ class NavidromeClient:
                 }
                 # Ensure all query params are strings for requests and type-checkers
                 safe_query = {k: str(v) for k, v in query.items()}
-                response = self.session.get(f"{self.base_url}/rest/{endpoint}", params=safe_query, timeout=10)
+                request_timeout = request_timeouts[min(attempt, len(request_timeouts) - 1)]
+                response = self.session.get(
+                    f"{self.base_url}/rest/{endpoint}",
+                    params=safe_query,
+                    timeout=request_timeout,
+                )
                 
                 # Handle server errors with retry
                 if response.status_code >= 500:
@@ -343,7 +350,7 @@ class NavidromeClient:
                         logging.warning(f"{LIGHT_YELLOW}Navidrome server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
                         continue
                     wait_time = retry_delays[attempt]
-                    logging.warning(f"{LIGHT_YELLOW}Navidrome server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
+                    logging.warning(f"{LIGHT_YELLOW}Navidrome server error {response.status_code} after {request_timeout}s timeout. Attempt {attempt + 1}/{max_retries}. Retrying in {wait_time}s...{RESET}")
                     time.sleep(wait_time)
                     continue
                 
@@ -358,11 +365,12 @@ class NavidromeClient:
                 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 short = _format_conn_error(e, "Navidrome")
+                request_timeout = request_timeouts[min(attempt, len(request_timeouts) - 1)]
                 if attempt >= max_retries - 1:
-                    logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
+                    logging.warning(f"{LIGHT_YELLOW}{short} after {request_timeout}s timeout. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
                     continue
                 wait_time = retry_delays[attempt]
-                logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
+                logging.warning(f"{LIGHT_YELLOW}{short} after {request_timeout}s timeout. Attempt {attempt + 1}/{max_retries}. Retrying in {wait_time}s...{RESET}")
                 time.sleep(wait_time)
                 continue
             except requests.exceptions.RequestException as e:
