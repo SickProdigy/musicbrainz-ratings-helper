@@ -16,6 +16,7 @@ import logging
 import os
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 import time
 import xml.etree.ElementTree as ET
@@ -30,8 +31,10 @@ init(autoreset=False)
 
 MUSICBRAINZ_BASE_URL = "https://musicbrainz.org/ws/2"
 MUSICBRAINZ_XML_NS = "http://musicbrainz.org/ns/mmd-2.0#"
-CLIENT_NAME = "musicbrainz-ratings-helper-0.1.0"
-SCRIPT_VERSION = "v0.1.0"
+CLIENT_NAME = "musicbrainz-ratings-helper-0.1.1"
+SCRIPT_VERSION = "v0.1.1"
+NAVIDROME_RETRY_DELAYS = [2, 4, 6, 8, 10]
+MUSICBRAINZ_RETRY_DELAYS = [3, 10, 30, 60, 120]
 
 # Colors for logging
 LIGHT_PURPLE = Fore.MAGENTA + Style.BRIGHT
@@ -77,6 +80,12 @@ class RatingRow:
 
 PreparedRow = tuple[str, str, int, RatingRow]
 SubmissionCounts = dict[str, int]
+
+
+class MusicBrainzBadRequest(Exception):
+    def __init__(self, response: requests.Response) -> None:
+        self.response = response
+        super().__init__(str(response))
 
 
 def empty_submission_counts() -> SubmissionCounts:
@@ -140,6 +149,16 @@ def parse_args() -> argparse.Namespace:
         "--artist-id",
         default=None,
         help="Limit album and song processing to a single Navidrome artist ID.",
+    )
+    parser.add_argument(
+        "--start-artist-id",
+        default=None,
+        help="Resume artist-order processing at this Navidrome artist ID and continue onward.",
+    )
+    parser.add_argument(
+        "--start-album-id",
+        default=None,
+        help="Resume album/song processing at this Navidrome album ID and continue onward.",
     )
     parser.add_argument(
         "--mb-username",
@@ -300,7 +319,8 @@ class NavidromeClient:
 
     def _request(self, endpoint: str, params: dict[str, object]) -> dict:
         """Make a Navidrome API request with retry logic and exponential backoff."""
-        max_retries = 5
+        retry_delays = NAVIDROME_RETRY_DELAYS
+        max_retries = len(retry_delays)
         
         for attempt in range(max_retries):
             try:
@@ -319,7 +339,10 @@ class NavidromeClient:
                 
                 # Handle server errors with retry
                 if response.status_code >= 500:
-                    wait_time = (attempt + 1) * 2
+                    if attempt >= max_retries - 1:
+                        logging.warning(f"{LIGHT_YELLOW}Navidrome server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
+                        continue
+                    wait_time = retry_delays[attempt]
                     logging.warning(f"{LIGHT_YELLOW}Navidrome server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
                     time.sleep(wait_time)
                     continue
@@ -334,8 +357,11 @@ class NavidromeClient:
                 return payload.get("subsonic-response", payload)
                 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                wait_time = (attempt + 1) * 2
                 short = _format_conn_error(e, "Navidrome")
+                if attempt >= max_retries - 1:
+                    logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
+                    continue
+                wait_time = retry_delays[attempt]
                 logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
                 time.sleep(wait_time)
                 continue
@@ -369,18 +395,17 @@ class NavidromeClient:
         response = self._request("getArtist", {"id": artist_id})
         return response.get("artist", {})
 
-    def get_all_albums(self, page_size: int = 500) -> list[dict]:
-        albums: list[dict] = []
+    def iter_all_albums(self, page_size: int = 500):
         offset = 0
         while True:
             page = self.get_album_list_page(offset, page_size)
             if not page:
                 break
-            albums.extend(page)
+            for album in page:
+                yield album
             if len(page) < page_size:
                 break
             offset += len(page)
-        return albums
 
     def build_rows(
         self,
@@ -389,19 +414,31 @@ class NavidromeClient:
         max_artists: int | None = None,
         max_albums: int | None = None,
         artist_id: str | None = None,
+        start_artist_id: str | None = None,
+        start_album_id: str | None = None,
     ):
         # When an explicit artist_id is provided we may need the artist twice
         # (for artist rows and for album/song collection). Fetch it once and reuse.
         artist_source: list[dict] | None = None
+        if artist_id or start_artist_id or "artist" in entities:
+            artist_source = ([self.get_artist(artist_id)] if artist_id else self.get_artists())
+
         if "artist" in entities:
             artist_rows = 0
-            # If an artist_id is provided, limit artist collection to that artist only.
-            artist_source = ([self.get_artist(artist_id)] if artist_id else self.get_artists())
-            for artist_index, artist in enumerate(artist_source):
+            started_artists = bool(artist_id or not start_artist_id)
+            found_start_artist = bool(artist_id or not start_artist_id)
+            printed_artist_header = False
+            for artist_index, artist in enumerate(artist_source or []):
                 if not artist:
                     continue
-                if artist_index == 0:
+                if not started_artists:
+                    if artist.get("id") != start_artist_id:
+                        continue
+                    started_artists = True
+                    found_start_artist = True
+                if not printed_artist_header:
                     log_blank_line()
+                    printed_artist_header = True
                 log_artist_header(artist.get("name", ""), artist.get("id", ""), artist_index)
                 rating = int(artist.get("userRating") or 0)
                 if rating <= 0:
@@ -423,25 +460,57 @@ class NavidromeClient:
                 artist_rows += 1
                 if max_artists is not None and artist_rows >= max_artists:
                     break
+            if start_artist_id and not artist_id and not found_start_artist:
+                logging.warning(f"{LIGHT_YELLOW}Start artist ID {start_artist_id} was not found.{RESET}")
 
         if "album" in entities or "song" in entities:
             album_rows = 0
             page_size = max_albums if max_albums is not None and max_albums > 0 else 500
-            # If an explicit artist_id was provided, reuse the previously fetched
-            # `artist_source` value instead of calling the API again.
+            # Album/song resume can be either exact album-order resume or artist-order resume.
             selected_artist = None
-            if artist_id and artist_source:
-                # artist_source is a list with one element when artist_id was used
-                selected_artist = artist_source[0]
+            album_source: Iterable[tuple[dict, dict | None, int | None]] = []
+            if artist_id:
+                selected_artist = (artist_source or [self.get_artist(artist_id)])[0]
+                album_source = [(album, selected_artist, 0) for album in selected_artist.get("album", [])]
+            elif start_artist_id:
+                album_rows_by_artist: list[tuple[dict, dict | None, int | None]] = []
+                started_album_artists = False
+                found_start_artist = False
+                for artist_index, artist in enumerate(artist_source or self.get_artists()):
+                    if not artist:
+                        continue
+                    if not started_album_artists:
+                        if artist.get("id") != start_artist_id:
+                            continue
+                        started_album_artists = True
+                        found_start_artist = True
+                    artist_detail = self.get_artist(artist.get("id", ""))
+                    if not artist_detail:
+                        continue
+                    for album in artist_detail.get("album", []):
+                        album_rows_by_artist.append((album, artist_detail, artist_index))
+                album_source = album_rows_by_artist
+                if not found_start_artist:
+                    logging.warning(f"{LIGHT_YELLOW}Start artist ID {start_artist_id} was not found for album/song processing.{RESET}")
             else:
-                selected_artist = self.get_artist(artist_id) if artist_id else None
+                if start_album_id:
+                    logging.info(f"Searching album/song resume point: {start_album_id}")
+                album_source = ((album, None, None) for album in self.iter_all_albums(page_size=page_size))
 
-            album_source = selected_artist.get("album", []) if selected_artist else self.get_all_albums(page_size=page_size)
-            # Only print the artist header here when we didn't already collect artist rows
-            if selected_artist and "artist" not in entities:
-                log_blank_line()
-                log_artist_header(selected_artist.get("name", ""), selected_artist.get("id", ""), 0)
-            for album in album_source:
+            started_albums = not start_album_id
+            found_start_album = not start_album_id
+            last_logged_album_artist_id = None
+            for album, album_artist, album_artist_index in album_source:
+                if not started_albums:
+                    if album.get("id") != start_album_id:
+                        continue
+                    started_albums = True
+                    found_start_album = True
+                    logging.info(f"Found album/song resume point: {album.get('name', '')} ({album.get('id', '')})")
+                if album_artist and "artist" not in entities and album_artist.get("id") != last_logged_album_artist_id:
+                    log_blank_line()
+                    log_artist_header(album_artist.get("name", ""), album_artist.get("id", ""), album_artist_index or 0)
+                    last_logged_album_artist_id = album_artist.get("id")
                 album_rows += 1
                 album_rating = int(album.get("userRating") or 0)
                 album_mbid = album.get("musicBrainzId") or ""
@@ -582,6 +651,9 @@ class NavidromeClient:
                         rating=song_rating,
                     )
 
+            if start_album_id and not found_start_album:
+                logging.warning(f"{LIGHT_YELLOW}Start album ID {start_album_id} was not found.{RESET}")
+
 
 class MusicBrainzClient:
     def __init__(self, client: str, username: str | None, password: str | None) -> None:
@@ -600,7 +672,9 @@ class MusicBrainzClient:
 
     def get_json(self, path: str, params: dict[str, object], allow_404: bool = False) -> dict:
         """Make a MusicBrainz API GET request with retry logic and exponential backoff."""
-        max_retries = 3
+        retry_delays = MUSICBRAINZ_RETRY_DELAYS
+        max_retries = len(retry_delays)
+        exhausted_retriable = False
         
         for attempt in range(max_retries):
             try:
@@ -618,7 +692,11 @@ class MusicBrainzClient:
                 
                 # Handle server errors with retry
                 if response.status_code >= 500:
-                    wait_time = (attempt + 1) * 2
+                    if attempt >= max_retries - 1:
+                        exhausted_retriable = True
+                        logging.warning(f"{LIGHT_YELLOW}MusicBrainz server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
+                        continue
+                    wait_time = retry_delays[attempt]
                     logging.warning(f"{LIGHT_YELLOW}MusicBrainz server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
                     time.sleep(wait_time)
                     continue
@@ -631,8 +709,12 @@ class MusicBrainzClient:
                 return response.json()
                 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                wait_time = (attempt + 1) * 2
                 short = _format_conn_error(e, "MusicBrainz")
+                if attempt >= max_retries - 1:
+                    exhausted_retriable = True
+                    logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
+                    continue
+                wait_time = retry_delays[attempt]
                 logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
                 time.sleep(wait_time)
                 continue
@@ -640,13 +722,18 @@ class MusicBrainzClient:
                 logging.error(f"{LIGHT_RED}MusicBrainz request failed: {e}{RESET}")
                 break
         
-        # If we get here, all retries failed
+        # If a transient MusicBrainz lookup keeps failing, skip that lookup and keep the run alive.
+        if exhausted_retriable:
+            logging.error(f"{LIGHT_RED}Skipping MusicBrainz path after {max_retries} attempts: {path}{RESET}")
+            return {}
+
         logging.error(f"{LIGHT_RED}Failed after {max_retries} attempts for MusicBrainz path: {path}{RESET}")
         raise SystemExit(1)
 
     def post_xml(self, path: str, xml_body: bytes) -> requests.Response:
         """Make a MusicBrainz API POST request with retry logic and exponential backoff."""
-        max_retries = 5
+        retry_delays = MUSICBRAINZ_RETRY_DELAYS
+        max_retries = len(retry_delays)
         
         for attempt in range(max_retries):
             try:
@@ -669,17 +756,26 @@ class MusicBrainzClient:
                 
                 # Handle server errors with retry
                 if response.status_code >= 500:
-                    wait_time = (attempt + 1) * 2
+                    if attempt >= max_retries - 1:
+                        logging.warning(f"{LIGHT_YELLOW}MusicBrainz server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
+                        continue
+                    wait_time = retry_delays[attempt]
                     logging.warning(f"{LIGHT_YELLOW}MusicBrainz server error {response.status_code}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
                     time.sleep(wait_time)
                     continue
                 
+                if response.status_code == 400:
+                    raise MusicBrainzBadRequest(response)
+
                 response.raise_for_status()
                 return response
                 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                wait_time = (attempt + 1) * 2
                 short = _format_conn_error(e, "MusicBrainz")
+                if attempt >= max_retries - 1:
+                    logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. No retries left.{RESET}")
+                    continue
+                wait_time = retry_delays[attempt]
                 logging.warning(f"{LIGHT_YELLOW}{short}. Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s...{RESET}")
                 time.sleep(wait_time)
                 continue
@@ -977,6 +1073,43 @@ def log_rating_result(
     )
 
 
+def submit_rating_values(
+    client: MusicBrainzClient,
+    entity_type: str,
+    values: list[tuple[str, int, RatingRow]],
+) -> int:
+    submission_rows = [(entity_type, entity_id, rating) for entity_id, rating, _ in values]
+    xml_body = build_submission(submission_rows)
+
+    try:
+        response = client.post_xml("/rating", xml_body)
+    except MusicBrainzBadRequest as exc:
+        if len(values) == 1:
+            entity_id, mb_rating, row = values[0]
+            logging.warning(
+                f"{LIGHT_YELLOW}{rating_entity_label(row.entity_type)}: s:{format_source_rating(row.rating)} -> "
+                f"mb:{format_musicbrainz_rating(mb_rating)} | Skipping invalid MusicBrainz target "
+                f"{entity_type}:{entity_id} | {row.title or row.artist} / {row.artist}: "
+                f"{exc.response.status_code}{RESET}"
+            )
+            return 0
+
+        split_at = len(values) // 2
+        logging.warning(
+            f"{LIGHT_YELLOW}MusicBrainz rejected {len(values)} {entity_type} ratings with 400. "
+            f"Isolating invalid target...{RESET}"
+        )
+        return submit_rating_values(client, entity_type, values[:split_at]) + submit_rating_values(
+            client, entity_type, values[split_at:]
+        )
+
+    for entity_id, mb_rating, row in values:
+        log_rating_result(row, mb_rating, response.status_code)
+
+    logging.info(f"{LIGHT_GREEN}Submitted {len(values)} {entity_type} ratings: {response.status_code}{RESET}")
+    return len(values)
+
+
 def submit_ratings(client: MusicBrainzClient, rows: list[PreparedRow], dry_run: bool) -> SubmissionCounts:
     # Group values by entity type but keep the original RatingRow for logging
     grouped_by_type: dict[str, list[tuple[str, int, RatingRow]]] = defaultdict(list)
@@ -989,7 +1122,6 @@ def submit_ratings(client: MusicBrainzClient, rows: list[PreparedRow], dry_run: 
     # Submit artist ratings first, then release-groups (albums), then recordings.
     for entity_type in ["artist", "release-group", "recording"]:
         values = grouped_by_type.get(entity_type, [])
-        counts[entity_type] = len(values)
         if not values:
             continue
 
@@ -998,22 +1130,14 @@ def submit_ratings(client: MusicBrainzClient, rows: list[PreparedRow], dry_run: 
         if entity_type == "release-group" and not dry_run:
             logging.info(f"{LIGHT_BLUE}rg_variants in this batch: {len(values)}{RESET}")
 
-        submission_rows = [(entity_type, entity_id, rating) for entity_id, rating, _ in values]
-        xml_body = build_submission(submission_rows)
-
         if dry_run:
             for _, mb_rating, row in values:
                 log_rating_result(row, mb_rating, "dry-run")
             logging.info(f"{LIGHT_GREEN}Submitted {len(values)} {entity_type} ratings: dry-run{RESET}")
+            counts[entity_type] = len(values)
             continue
 
-        response = client.post_xml("/rating", xml_body)
-
-        # After batch submit, log per-rating status lines and a summary
-        for entity_id, mb_rating, row in values:
-            log_rating_result(row, mb_rating, response.status_code)
-
-        logging.info(f"{LIGHT_GREEN}Submitted {len(values)} {entity_type} ratings: {response.status_code}{RESET}")
+        counts[entity_type] = submit_rating_values(client, entity_type, values)
 
     return counts
 
@@ -1124,7 +1248,8 @@ def main() -> int:
     mb_username = args.mb_username or os.environ.get("MB_USERNAME")
     mb_password = args.mb_password or os.environ.get("MB_PASSWORD")
 
-    entities = set(args.entity or ["song", "album", "artist"])
+    default_entities = ["song", "album"] if args.start_album_id else ["song", "album", "artist"]
+    entities = set(args.entity or default_entities)
 
     client = MusicBrainzClient(CLIENT_NAME, mb_username, mb_password)
     navidrome = NavidromeClient(
@@ -1135,17 +1260,18 @@ def main() -> int:
     )
 
     total_artists: int | None = None
-    if args.artist_id:
-        total_artists = 1
-    else:
-        try:
-            total_artists = len(navidrome.get_artists())
-        except SystemExit:
-            raise
-        except Exception as exc:
-            logging.warning(f"Could not determine total artists to process: {exc}")
-    if total_artists is not None:
-        logging.info(f"Total artists to process: {total_artists}")
+    if "artist" in entities:
+        if args.artist_id:
+            total_artists = 1
+        else:
+            try:
+                total_artists = len(navidrome.get_artists())
+            except SystemExit:
+                raise
+            except Exception as exc:
+                logging.warning(f"Could not determine total artists to process: {exc}")
+        if total_artists is not None:
+            logging.info(f"Total artists to process: {total_artists}")
 
     submission_buffer: list[PreparedRow] = []
     submit_batch_size = 100
@@ -1161,6 +1287,8 @@ def main() -> int:
         args.max_artists,
         args.max_albums,
         args.artist_id,
+        args.start_artist_id,
+        args.start_album_id,
         ):
         if row.entity_type == "album-boundary":
             if submission_buffer:
