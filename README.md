@@ -53,6 +53,18 @@ Run for one Navidrome artist:
 python musicbrainz-ratings-helper.py --dry-run --artist-id 5YPCM8WgUTYDxJPS8QUuOO
 ```
 
+Resume from a Navidrome artist and continue onward in artist order:
+
+```bash
+python musicbrainz-ratings-helper.py --start-artist-id 7dB07x8Q2P9jPvGeDHxIFa
+```
+
+Resume from a Navidrome album and continue onward in album-title order:
+
+```bash
+python musicbrainz-ratings-helper.py --start-album-id 5WYUQdSkSzSHf4714jsHDM
+```
+
 Submit ratings for real:
 
 ```bash
@@ -63,6 +75,8 @@ python musicbrainz-ratings-helper.py
 
 - `--dry-run` previews the same rating batches without posting to MusicBrainz.
 - `--artist-id ID` limits album and song processing to one Navidrome artist.
+- `--start-artist-id ID` skips artists until the matching Navidrome artist, then continues onward in artist order. Album/song processing also follows artist order when this flag is used.
+- `--start-album-id ID` skips album/song processing until the matching Navidrome album, then continues onward in the current album traversal order. When no `--entity` flags are provided, this resumes only `song` and `album` work. Skips all artists ratings. 
 - `--entity song`, `--entity album`, and `--entity artist` limit exported entity types. Repeat the flag for multiple types.
 - `--max-artists N` limits artist rating collection.
 - `--max-albums N` limits album/song collection.
