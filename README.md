@@ -10,6 +10,8 @@ The helper reads ratings from Navidrome through the Subsonic API and submits the
 
 For songs, release-group expansion is enabled by default. When a rated Navidrome song belongs to a MusicBrainz release group, the helper finds matching recordings in that group so alternate releases can receive the same recording rating.
 
+It can also run in a direct MusicBrainz force mode. In that mode, it bypasses Navidrome, walks every release group credited to a MusicBrainz artist MBID, and submits one forced release-group rating for each one.
+
 ## Setup
 
 Install dependencies:
@@ -41,7 +43,7 @@ The helper automatically reads `.env` from the current project directory.
 
 ## Usage
 
-Preview what would be submitted:
+Preview what would be submitted from Navidrome:
 
 ```bash
 python musicbrainz-ratings-helper.py --dry-run
@@ -65,10 +67,22 @@ Resume from a Navidrome album and continue onward in album-title order:
 python musicbrainz-ratings-helper.py --start-album-id 5WYUQdSkSzSHf4714jsHDM
 ```
 
-Submit ratings for real:
+Submit Navidrome ratings for real:
 
 ```bash
 python musicbrainz-ratings-helper.py
+```
+
+Preview forced release-group ratings for one MusicBrainz artist:
+
+```bash
+python musicbrainz-ratings-helper.py --force-artist-ratings 6b656576-9504-432e-823d-8920139db2f0 --override-rating 1 --max-release-groups 5 --dry-run
+```
+
+Submit forced release-group ratings for one MusicBrainz artist:
+
+```bash
+python musicbrainz-ratings-helper.py --force-artist-ratings 6b656576-9504-432e-823d-8920139db2f0 --override-rating 1
 ```
 
 ## Useful Flags
@@ -76,8 +90,12 @@ python musicbrainz-ratings-helper.py
 - `--dry-run` previews the same rating batches without posting to MusicBrainz.
 - `--artist-id ID` limits album and song processing to one Navidrome artist.
 - `--start-artist-id ID` skips artists until the matching Navidrome artist, then continues onward in artist order. Album/song processing also follows artist order when this flag is used.
-- `--start-album-id ID` skips album/song processing until the matching Navidrome album, then continues onward in the current album traversal order. When no `--entity` flags are provided, this resumes only `song` and `album` work. Skips all artists ratings. 
+- `--start-album-id ID` skips album/song processing until the matching Navidrome album, then continues onward in the current album traversal order. When no `--entity` flags are provided, this resumes only `song` and `album` work. Skips all artist ratings.
 - `--entity song`, `--entity album`, and `--entity artist` limit exported entity types. Repeat the flag for multiple types.
+- `--override-rating N` submits `N` as the source rating instead of each Navidrome rating. Use a 0-5 value; `1` submits a one-star MusicBrainz rating.
+- `--include-unrated-albums` includes unrated Navidrome albums when exporting `--entity album` with `--override-rating`.
+- `--force-artist-ratings MBID` bypasses Navidrome and forces release-group ratings directly for every release group credited to the MusicBrainz artist MBID. This mode supports album/release-group ratings only and requires `--override-rating`.
+- `--max-release-groups N` limits how many MusicBrainz release groups are collected in `--force-artist-ratings` mode.
 - `--max-artists N` limits artist rating collection.
 - `--max-albums N` limits album/song collection.
 - `--no-expand-release-groups` disables recording fan-out within release groups.
@@ -93,14 +111,27 @@ Album: s:3 -> mb:60 | Murda She Wrote / 3Breezy: dry-run
 Recording: s:2 -> mb:40 | Bacc To Tha Basics / 3Breezy: dry-run
 ```
 
+Force mode logs one release-group rating per MusicBrainz release group:
+
+```text
+Album: s:1 -> mb:20 | Example Album / Example Artist: dry-run
+```
+
 The final summary includes scanned counts and previewed/submitted counts.
 
 Detailed recording ID resolution is logged only with `--log-level DEBUG`.
+
+Each run also writes a timestamped log file in `logs/`, for example:
+
+```text
+logs/musicbrainz-ratings-helper_1783864011.log
+```
 
 ## Notes
 
 - Navidrome uses 1-5 star ratings. MusicBrainz user ratings use a 0-100 scale, so the helper submits `rating * 20`.
 - Zero or missing ratings are skipped.
+- In `--force-artist-ratings` mode, MusicBrainz release groups are taken from the MusicBrainz artist browse results, so the list can be much larger than the albums you have in Navidrome.
 - MusicBrainz API requests are throttled to about one request per second.
 - Rating submissions are batched into one MusicBrainz POST where possible instead of sending one request per rating.
 - Navidrome access uses the Subsonic API only; the helper does not read the Navidrome database directly.

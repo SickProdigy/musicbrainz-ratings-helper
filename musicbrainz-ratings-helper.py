@@ -100,7 +100,7 @@ def add_submission_counts(total: SubmissionCounts, increment: SubmissionCounts) 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Push Navidrome ratings to MusicBrainz."
+        description="Push Navidrome ratings to MusicBrainz or force MusicBrainz artist release-group ratings."
     )
     parser.add_argument(
         "--navidrome-base-url",
