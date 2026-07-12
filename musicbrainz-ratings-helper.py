@@ -147,6 +147,28 @@ def parse_args() -> argparse.Namespace:
         help="Limit how many album ratings are collected. Useful for short album-only tests.",
     )
     parser.add_argument(
+        "--override-rating",
+        type=int,
+        default=None,
+        help="Submit this Navidrome-style rating value instead of each source rating. Use 1 to force one-star MusicBrainz ratings.",
+    )
+    parser.add_argument(
+        "--include-unrated-albums",
+        action="store_true",
+        help="With --entity album and --override-rating, include albums even when Navidrome has no album rating.",
+    )
+    parser.add_argument(
+        "--force-artist-ratings",
+        default=None,
+        help="MusicBrainz artist MBID whose release-group ratings should be forced directly, bypassing Navidrome.",
+    )
+    parser.add_argument(
+        "--max-release-groups",
+        type=int,
+        default=None,
+        help="Limit MusicBrainz release-groups collected in --force-artist-ratings mode.",
+    )
+    parser.add_argument(
         "--artist-id",
         default=None,
         help="Limit album and song processing to a single Navidrome artist ID.",
@@ -424,6 +446,8 @@ class NavidromeClient:
         artist_id: str | None = None,
         start_artist_id: str | None = None,
         start_album_id: str | None = None,
+        override_rating: int | None = None,
+        include_unrated_albums: bool = False,
     ):
         # When an explicit artist_id is provided we may need the artist twice
         # (for artist rows and for album/song collection). Fetch it once and reuse.
@@ -521,6 +545,9 @@ class NavidromeClient:
                     last_logged_album_artist_id = album_artist.get("id")
                 album_rows += 1
                 album_rating = int(album.get("userRating") or 0)
+                source_album_rating = album_rating
+                if override_rating is not None:
+                    album_rating = override_rating
                 album_mbid = album.get("musicBrainzId") or ""
                 if album_mbid:
                     logging.debug(f"Resolving release-group for album '{album.get('name','')}' release:{album_mbid}")
@@ -543,7 +570,7 @@ class NavidromeClient:
                                 break
 
                 # Print album header only if the album has a rating or contains rated songs
-                if album_rating > 0 or has_rated_songs:
+                if album_rating > 0 or has_rated_songs or ("album" in entities and include_unrated_albums and override_rating is not None):
                     yield RatingRow(
                         entity_type="album-boundary",
                         navidrome_id=album.get("id", ""),
@@ -554,6 +581,8 @@ class NavidromeClient:
                         release_mbid=album_mbid or None,
                         rating=0,
                     )
+                    if override_rating is not None and source_album_rating != album_rating:
+                        logging.info(f"    Override album rating: source s:{format_source_rating(source_album_rating)} -> forced s:{format_source_rating(album_rating)}")
                     log_album_header(
                         album.get("name", ""),
                         album.get("id", ""),
@@ -563,7 +592,7 @@ class NavidromeClient:
                     )
 
                 if "album" in entities:
-                    if album_rating > 0:
+                    if album_rating > 0 or (include_unrated_albums and override_rating is not None):
                         if album_release_group_mbid:
                             yield RatingRow(
                                 entity_type="album",
@@ -737,6 +766,30 @@ class MusicBrainzClient:
 
         logging.error(f"{LIGHT_RED}Failed after {max_retries} attempts for MusicBrainz path: {path}{RESET}")
         raise SystemExit(1)
+
+    def iter_artist_release_groups(self, artist_mbid: str, page_size: int = 100):
+        """Yield all release-groups credited to a MusicBrainz artist."""
+        offset = 0
+        while True:
+            payload = self.get_json(
+                "/release-group",
+                {
+                    "artist": artist_mbid,
+                    "fmt": "json",
+                    "limit": page_size,
+                    "offset": offset,
+                    "inc": "artist-credits",
+                },
+                allow_404=True,
+            )
+            release_groups = payload.get("release-groups", [])
+            if not release_groups:
+                break
+            for release_group in release_groups:
+                yield release_group
+            if len(release_groups) < page_size:
+                break
+            offset += len(release_groups)
 
     def post_xml(self, path: str, xml_body: bytes) -> requests.Response:
         """Make a MusicBrainz API POST request with retry logic and exponential backoff."""
@@ -1171,6 +1224,43 @@ def flush_submission_buffer(
     buffer.clear()
     return counts
 
+def musicbrainz_artist_release_group_rows(
+    client: MusicBrainzClient,
+    artist_mbid: str,
+    rating: int,
+    max_release_groups: int | None = None,
+):
+    """Build album-style rows from MusicBrainz release-groups for one artist."""
+    seen: set[str] = set()
+    count = 0
+    logging.info(f"Fetching MusicBrainz release-groups for artist MBID: {artist_mbid}")
+    for release_group in client.iter_artist_release_groups(artist_mbid):
+        release_group_mbid = release_group.get("id") or ""
+        if not release_group_mbid or release_group_mbid in seen:
+            continue
+        seen.add(release_group_mbid)
+        artist_name = "".join(
+            str(credit.get("name", ""))
+            for credit in release_group.get("artist-credit", [])
+            if isinstance(credit, dict)
+        ).strip()
+        title = release_group.get("title", "")
+        logging.info(
+            f"  Album: {title} | mbidRG:{release_group_mbid} | forced s:{format_source_rating(rating)}"
+        )
+        yield RatingRow(
+            entity_type="album",
+            navidrome_id=release_group_mbid,
+            mbid=release_group_mbid,
+            title=title,
+            artist=artist_name,
+            release_group_mbid=release_group_mbid,
+            release_mbid=None,
+            rating=rating,
+        )
+        count += 1
+        if max_release_groups is not None and count >= max_release_groups:
+            break
 
 def album_batch_key(row: RatingRow) -> str:
     return row.release_mbid or row.release_group_mbid or row.navidrome_id
@@ -1238,37 +1328,58 @@ def main() -> int:
     if args.dry_run:
         logging.info("Preview mode, no changes will be made.")
 
-    navidrome_base_url = required_arg(
-        args.navidrome_base_url,
-        "NAVIDROME_BASE_URL",
-        "navidrome-base-url",
-    )
-    navidrome_username = required_arg(
-        args.navidrome_username,
-        "NAVIDROME_USERNAME",
-        "navidrome-username",
-    )
-    navidrome_password = required_arg(
-        args.navidrome_password,
-        "NAVIDROME_PASSWORD",
-        "navidrome-password",
-    )
+    force_artist_ratings_mode = bool(args.force_artist_ratings)
     mb_username = args.mb_username or os.environ.get("MB_USERNAME")
     mb_password = args.mb_password or os.environ.get("MB_PASSWORD")
 
-    default_entities = ["song", "album"] if args.start_album_id else ["song", "album", "artist"]
+    default_entities = ["album"] if force_artist_ratings_mode else (["song", "album"] if args.start_album_id else ["song", "album", "artist"])
     entities = set(args.entity or default_entities)
+    if args.override_rating is not None and not 0 <= args.override_rating <= 5:
+        logging.error("--override-rating must be between 0 and 5.")
+        return 2
+    if args.include_unrated_albums and args.override_rating is None:
+        logging.error("--include-unrated-albums requires --override-rating.")
+        return 2
+    if force_artist_ratings_mode:
+        if entities != {"album"}:
+            logging.error("--force-artist-ratings supports album/release-group ratings only. Use --entity album or omit --entity.")
+            return 2
+        if args.override_rating is None:
+            logging.error("--force-artist-ratings requires --override-rating.")
+            return 2
+        if any([args.artist_id, args.start_artist_id, args.start_album_id]):
+            logging.error("--force-artist-ratings cannot be combined with Navidrome artist/resume filters.")
+            return 2
+    if args.override_rating is not None:
+        logging.info(f"Overriding submitted source ratings to s:{format_source_rating(args.override_rating)} / mb:{format_musicbrainz_rating(rating_to_musicbrainz(args.override_rating))}.")
 
     client = MusicBrainzClient(CLIENT_NAME, mb_username, mb_password)
-    navidrome = NavidromeClient(
-        navidrome_base_url,
-        navidrome_username,
-        navidrome_password,
-        CLIENT_NAME,
-    )
-
-    total_artists: int | None = None
-    if "artist" in entities:
+    navidrome: NavidromeClient | None = None
+    if not force_artist_ratings_mode:
+        navidrome_base_url = required_arg(
+            args.navidrome_base_url,
+            "NAVIDROME_BASE_URL",
+            "navidrome-base-url",
+        )
+        navidrome_username = required_arg(
+            args.navidrome_username,
+            "NAVIDROME_USERNAME",
+            "navidrome-username",
+        )
+        navidrome_password = required_arg(
+            args.navidrome_password,
+            "NAVIDROME_PASSWORD",
+            "navidrome-password",
+        )
+        navidrome = NavidromeClient(
+            navidrome_base_url,
+            navidrome_username,
+            navidrome_password,
+            CLIENT_NAME,
+        )
+    total_artists: int | None = 1 if force_artist_ratings_mode else None
+    if not force_artist_ratings_mode and "artist" in entities:
+        assert navidrome is not None
         if args.artist_id:
             total_artists = 1
         else:
@@ -1278,9 +1389,8 @@ def main() -> int:
                 raise
             except Exception as exc:
                 logging.warning(f"Could not determine total artists to process: {exc}")
-        if total_artists is not None:
-            logging.info(f"Total artists to process: {total_artists}")
-
+    if total_artists is not None:
+        logging.info(f"Total artists to process: {total_artists}")
     submission_buffer: list[PreparedRow] = []
     submit_batch_size = 100
     resolved_any = False
@@ -1289,15 +1399,28 @@ def main() -> int:
     album_count = 0
     current_album_key: str | None = None
 
-    for row in navidrome.build_rows(
-        entities,
-        client,
-        args.max_artists,
-        args.max_albums,
-        args.artist_id,
-        args.start_artist_id,
-        args.start_album_id,
-        ):
+    if force_artist_ratings_mode:
+        row_source = musicbrainz_artist_release_group_rows(
+            client,
+            args.force_artist_ratings,
+            args.override_rating,
+            args.max_release_groups,
+        )
+    else:
+        assert navidrome is not None
+        row_source = navidrome.build_rows(
+            entities,
+            client,
+            args.max_artists,
+            args.max_albums,
+            args.artist_id,
+            args.start_artist_id,
+            args.start_album_id,
+            args.override_rating,
+            args.include_unrated_albums,
+        )
+
+    for row in row_source:
         if row.entity_type == "album-boundary":
             if submission_buffer:
                 flush_and_count(submission_buffer, client, args.dry_run, submitted_counts)
@@ -1346,7 +1469,7 @@ def main() -> int:
         flush_and_count(submission_buffer, client, args.dry_run, submitted_counts)
 
     if not resolved_any:
-        logging.info(f"{LIGHT_RED}No MusicBrainz targets could be resolved from the Navidrome ratings.{RESET}")
+        logging.info(f"{LIGHT_RED}No MusicBrainz targets could be resolved.{RESET}")
         return 0
 
     # Emit a concise run summary (Tracks / Found / Skipped / Not Found / Match% / Time)
@@ -1370,3 +1493,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
